@@ -5,110 +5,166 @@ using System.Linq;
 using System.Net.Http;
 using System.Threading.Tasks;
 using ApiMiddleware.Data;
-using ApiMiddleware.Models.DTOs;
 using Microsoft.Extensions.Configuration;
 
-namespace ApiMiddleware.Services
-{
-    public class HealthCheckService
-    {
-        private readonly AppDbContext _context;
-        private readonly IHttpClientFactory _httpClientFactory;
-        private readonly IConfiguration _configuration;
+namespace ApiMiddleware.Services;
 
-        public HealthCheckService(
-            AppDbContext context,
-            IHttpClientFactory httpClientFactory,
-            IConfiguration configuration)
+public class HealthCheckService
+{
+    private readonly AppDbContext _context;
+    private readonly IHttpClientFactory _httpClientFactory;
+    private readonly string _mlServerUrl;
+    private readonly string _honeypotUrl;
+    private readonly string _realSystemUrl;
+
+    public HealthCheckService(
+        AppDbContext context,
+        IHttpClientFactory httpClientFactory,
+        IConfiguration configuration)
         {
             _context = context;
             _httpClientFactory = httpClientFactory;
-            _configuration = configuration;
+
+            _mlServerUrl = (configuration["MLServer:Url"] ?? "http://localhost:8000").TrimEnd('/');
+            _honeypotUrl = (configuration["ServiceUrls:HoneypotApi"] ?? "http://localhost:5001").TrimEnd('/');
+            _realSystemUrl = (configuration["ServiceUrls:RealSystem"] ?? "http://localhost:5000").TrimEnd('/');
         }
 
-        public async Task<HealthCheckResponse> CheckAllServicesAsync()
+    public async Task<HealthCheckResponse> CheckAllServicesAsync()
+    {
+        var services = new Dictionary<string, ServiceHealth>();
+
+        // 1. Database
+        services["database"] = await CheckDatabaseAsync();
+
+        // 2. Isolation Forest ML Server
+        services["isolation_forest_server"] = await CheckExternalServiceAsync(_mlServerUrl, "ML Server");
+
+        // 3. Honeypot API
+        services["honeypot_api"] = await CheckExternalServiceAsync(_honeypotUrl, "Honeypot");
+
+        // 4. Real Production System
+        services["real_system"] = await CheckExternalServiceAsync(_realSystemUrl, "Real System");
+
+        bool allHealthy = services.Values.All(s => s.Status == "healthy");
+
+        return new HealthCheckResponse
         {
-            var services = new Dictionary<string, ServiceHealth>();
+            Status = allHealthy ? "healthy" : "degraded",
+            Timestamp = DateTime.UtcNow,
+            OverallHealth = allHealthy
+                ? "All systems operational"
+                : "One or more services are down or slow",
+            Services = services
+        };
+    }
 
-            // Database
-            services["database"] = await CheckDatabaseAsync();
-
-            // IsolationForestServer
-            services["isolation_forest_server"] =
-                await CheckServiceAsync(_configuration["ServiceUrls:IsolationForestServer"]);
-
-            // Honeypot API
-            services["honeypot_api"] =
-                await CheckServiceAsync(_configuration["ServiceUrls:HoneypotApi"]);
-
-            // Real System
-            services["real_system"] =
-                await CheckServiceAsync(_configuration["ServiceUrls:RealSystem"]);
-
-            // Overall health
-            var allHealthy = services.Values.All(s => s.Status == "healthy");
-            var overallHealth =
-                allHealthy ? "All systems operational" : "One or more services degraded";
-
-            return new HealthCheckResponse
+    private async Task<ServiceHealth> CheckDatabaseAsync()
+    {
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            var canConnect = await _context.Database.CanConnectAsync();
+            sw.Stop();
+            return new ServiceHealth
             {
-                Status = allHealthy ? "healthy" : "degraded",
-                Timestamp = DateTime.UtcNow,
-                Services = services,
-                OverallHealth = overallHealth
+                Status = canConnect ? "healthy" : "unhealthy",
+                ResponseTimeMs = (int)sw.ElapsedMilliseconds,
+                Details = canConnect ? "Connected successfully" : "Cannot reach database"
+            };
+        }
+        catch (Exception ex)
+        {
+            sw.Stop();
+            return new ServiceHealth
+            {
+                Status = "unhealthy",
+                ResponseTimeMs = (int)sw.ElapsedMilliseconds,
+                Details = $"Error: {ex.GetType().Name}"
+            };
+        }
+    }
+
+    private async Task<ServiceHealth> CheckExternalServiceAsync(string baseUrl, string name)
+    {
+        if (string.IsNullOrWhiteSpace(baseUrl))
+        {
+            return new ServiceHealth
+            {
+                Status = "unhealthy",
+                ResponseTimeMs = 0,
+                Details = "URL not configured"
             };
         }
 
-        private async Task<ServiceHealth> CheckDatabaseAsync()
+        var sw = Stopwatch.StartNew();
+        var client = _httpClientFactory.CreateClient();
+        client.Timeout = TimeSpan.FromSeconds(8);
+
+        try
         {
-            var stopwatch = Stopwatch.StartNew();
-            try
+            // Try common health endpoints
+            var urlsToTry = new[]
             {
-                await _context.Database.CanConnectAsync();
-                stopwatch.Stop();
-                return new ServiceHealth
-                {
-                    Status = "healthy",
-                    ResponseTimeMs = (int)stopwatch.ElapsedMilliseconds
-                };
-            }
-            catch
+                $"{baseUrl}/health",
+                $"{baseUrl}/api/health",
+                $"{baseUrl}/",
+                baseUrl
+            };
+
+            HttpResponseMessage? response = null;
+            foreach (var url in urlsToTry)
             {
-                stopwatch.Stop();
-                return new ServiceHealth
+                try
                 {
-                    Status = "unhealthy",
-                    ResponseTimeMs = (int)stopwatch.ElapsedMilliseconds
-                };
+                    response = await client.GetAsync(url);
+                    if (response.IsSuccessStatusCode) break;
+                }
+                catch
+                {
+                    continue;
+                }
             }
+
+            sw.Stop();
+
+            bool isHealthy = response?.IsSuccessStatusCode == true;
+
+            return new ServiceHealth
+            {
+                Status = isHealthy ? "healthy" : "unhealthy",
+                Url = baseUrl,
+                ResponseTimeMs = (int)sw.ElapsedMilliseconds,
+                Details = isHealthy ? "OK" : $"Failed ({response?.StatusCode})"
+            };
         }
-
-        private async Task<ServiceHealth> CheckServiceAsync(string url)
+        catch (Exception ex) when (ex is TaskCanceledException || ex is HttpRequestException)
         {
-            var stopwatch = Stopwatch.StartNew();
-            var client = _httpClientFactory.CreateClient();
-
-            try
+            sw.Stop();
+            return new ServiceHealth
             {
-                var response = await client.GetAsync($"{url}/");
-                stopwatch.Stop();
-                return new ServiceHealth
-                {
-                    Status = response.IsSuccessStatusCode ? "healthy" : "unhealthy",
-                    Url = url,
-                    ResponseTimeMs = (int)stopwatch.ElapsedMilliseconds
-                };
-            }
-            catch
-            {
-                stopwatch.Stop();
-                return new ServiceHealth
-                {
-                    Status = "unhealthy",
-                    Url = url,
-                    ResponseTimeMs = (int)stopwatch.ElapsedMilliseconds
-                };
-            }
+                Status = "unhealthy",
+                Url = baseUrl,
+                ResponseTimeMs = (int)sw.ElapsedMilliseconds,
+                Details = $"Timeout or unreachable ({ex.GetType().Name})"
+            };
         }
     }
+}
+
+// DTOs used by HealthCheck
+public class HealthCheckResponse
+{
+    public string Status { get; set; } = "healthy";
+    public DateTime Timestamp { get; set; }
+    public string OverallHealth { get; set; } = "";
+    public Dictionary<string, ServiceHealth> Services { get; set; } = new();
+}
+
+public class ServiceHealth
+{
+    public string Status { get; set; } = "healthy"; // healthy, unhealthy
+    public string? Url { get; set; }
+    public int ResponseTimeMs { get; set; }
+    public string? Details { get; set; }
 }

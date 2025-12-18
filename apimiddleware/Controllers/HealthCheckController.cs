@@ -1,28 +1,40 @@
-using Microsoft.AspNetCore.Mvc;
-
 using System.Threading.Tasks;
-using Microsoft.AspNetCore.Mvc;
 using ApiMiddleware.Services;
+using Microsoft.AspNetCore.Mvc;
 
-namespace ApiMiddleware.Controllers
+namespace ApiMiddleware.Controllers;
+
+/// <summary>
+/// Health check endpoint – used by load balancers, monitoring tools, and Admin Dashboard
+/// GET /health ? returns full system status
+/// </summary>
+[ApiController]
+[Route("health")]  // ? This matches the documentation and GatewayMiddleware skip list
+public class HealthController : ControllerBase
 {
-    [ApiController]
-    [Route("api/[controller]")]
-    public class HealthCheckController : ControllerBase
+    private readonly HealthCheckService _healthCheckService;
+
+    public HealthController(HealthCheckService healthCheckService)
     {
-        private readonly HealthCheckService _healthCheckService;
+        _healthCheckService = healthCheckService;
+    }
 
-        public HealthCheckController(HealthCheckService healthCheckService)
-        {
-            _healthCheckService = healthCheckService;
-        }
+    /// <summary>
+    /// GET /health
+    /// Returns detailed health of all components:
+    /// - Database
+    /// - Isolation Forest ML Server
+    /// - Honeypot API
+    /// - Real Production System
+    /// </summary>
+    [HttpGet]
+    public async Task<IActionResult> Get()
+    {
+        var result = await _healthCheckService.CheckAllServicesAsync();
 
-        // GET: api/HealthCheck/status
-        [HttpGet("status")]
-        public async Task<IActionResult> GetStatus()
-        {
-            var result = await _healthCheckService.CheckAllServicesAsync();
-            return Ok(result);
-        }
+        // Return proper HTTP status codes
+        return result.Status == "healthy"
+            ? Ok(result)           // 200 OK
+            : StatusCode(503, result); // 503 Service Unavailable
     }
 }

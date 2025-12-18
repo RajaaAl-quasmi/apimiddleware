@@ -1,59 +1,57 @@
-﻿
-using System;
-using System.ComponentModel.DataAnnotations;
+﻿using System.ComponentModel.DataAnnotations;
 using System.ComponentModel.DataAnnotations.Schema;
 
-namespace ApiMiddleware.Models
+namespace ApiMiddleware.Models;
+
+public class RoutingDecision
 {
-    public class RoutingDecision
-    {
-        [Key]
-        public int Id { get; set; }
+    [Key]
+    public int Id { get; set; }
 
-        // ===== Request metadata =====
-        [Required]
-        [MaxLength(150)]
-        public string RequestId { get; set; }
+    // Unique request identifier (same as in CachedRequest)
+    [Required]
+    [MaxLength(100)]
+    public string RequestId { get; set; } = string.Empty;
 
-        public bool IsAnomaly { get; set; }
+    // Foreign key to the cached request
+    [Required]
+    public int CachedRequestId { get; set; }
 
-        public float Confidence { get; set; }
+    // Navigation property
+    public CachedRequest? CachedRequest { get; set; }
 
-        [MaxLength(100)]
-        public string MLModelVersion { get; set; }
+    // Result from Isolation Forest ML model
+    [Required]
+    public bool IsAnomaly { get; set; }
 
-        // ===== Routing result =====
-        [MaxLength(300)]
-        public string RoutedTo { get; set; }
+    [Column(TypeName = "decimal(18,8)")]
+    public decimal Confidence { get; set; }
 
-        [MaxLength(500)]
-        public string TargetUrl { get; set; }
+    [MaxLength(50)]
+    public string? ModelVersion { get; set; }
 
-        public int ResponseStatusCode { get; set; }
+    // Where the request was routed: "Honeypot" or "RealSystem"
+    [Required]
+    [MaxLength(20)]
+    public string RoutedTo { get; set; } = string.Empty;
 
-        public int ResponseTimeMs { get; set; }
+    // Response from the target system
+    [Required]
+    public int ResponseStatusCode { get; set; }
 
-        // ===== Response body (TEXT) =====
-        [Column(TypeName = "TEXT")]
-        public string ResponseBodyJson { get; set; }
+    [Required]
+    public long ResponseTimeMs { get; set; }
 
-        // ===== Response headers (TEXT) =====
-        [Column(TypeName = "TEXT")]
-        public string ResponseHeadersJson { get; set; }
+    [Column(TypeName = "TEXT")]
+    public string? ResponseHeadersJson { get; set; }
 
-        // ===== Error handling =====
-        public bool RoutingError { get; set; }
+    [Column(TypeName = "TEXT")]
+    public string? ResponseBodyPreview { get; set; } // First 1000 chars or null
 
-        [MaxLength(600)]
-        public string ErrorMessage { get; set; }
+    // Timestamps
+    public DateTime DecidedAt { get; set; } = DateTime.UtcNow;
 
-        // ===== Date =====
-        public DateTime RoutedAt { get; set; } = DateTime.UtcNow;
+    public DateTime? ForwardedAt { get; set; }
 
-        // ===== Navigation إلى CachedRequest =====
-        public int? CachedRequestId { get; set; }   // مفتاح أجنبي اختياري
-
-        [ForeignKey(nameof(CachedRequestId))]
-        public CachedRequest CachedRequest { get; set; }
-    }
+    public DateTime? RespondedAt { get; set; }
 }

@@ -1,163 +1,176 @@
-﻿using System.Text.Json;
+﻿using System.Text;
+using System.Text.Json;
+using ApiMiddleware.Models;
 using ApiMiddleware.Models.DTOs;
 using ApiMiddleware.Services;
+using Microsoft.AspNetCore.Http.Extensions;
+using Microsoft.Net.Http.Headers;
 
-namespace ApiMiddleware.Middleware
+namespace ApiMiddleware.Middleware;
+
+public class GatewayMiddleware
 {
-    public class GatewayMiddleware
-    {
-        private readonly RequestDelegate _next;
-        private readonly ILogger<GatewayMiddleware> _logger;
+    private readonly RequestDelegate _next;
+    private readonly ILogger<GatewayMiddleware> _logger;
 
-        public GatewayMiddleware(RequestDelegate next, ILogger<GatewayMiddleware> logger)
+    public GatewayMiddleware(RequestDelegate next, ILogger<GatewayMiddleware> logger)
+    {
+        _next = next;
+        _logger = logger;
+    }
+
+    public async Task InvokeAsync(
+        HttpContext context,
+        RequestCacheService cacheService,
+        IsolationForestClient isolationClient,
+        RoutingService routingService)
+    {
+        var path = context.Request.Path.Value?.ToLowerInvariant() ?? "";
+
+        // Skip gateway logic for health, audit, swagger, etc.
+        if (path.StartsWith("/health") ||
+            path.StartsWith("/audit") ||
+            path.StartsWith("/swagger") ||
+            path.StartsWith("/favicon.ico"))
         {
-            _next = next;
-            _logger = logger;
+            await _next(context);
+            return;
         }
 
-        public async Task InvokeAsync(
-            HttpContext context,
-            RequestCacheService cacheService,
-            IsolationForestClient isolationClient,
-            RoutingService routingService)
+        string requestId = Guid.NewGuid().ToString("N").Substring(0, 16); // e.g. a1b2c3d4e5f67890
+        string clientIp = GetClientIp(context);
+
+        try
         {
-            var path = context.Request.Path.Value?.ToLower() ?? string.Empty;
+            // 1. Cache the original request
+            await cacheService.CacheRequestAsync(context.Request, requestId, clientIp);
 
-            // ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
-            // 1️⃣   تخطي مسارات الصحة والإحصائيات
-            // ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
-            if (path.StartsWith("/api/health") || path.StartsWith("/api/statistics") || path.StartsWith("/api/audit"))
+            // 2. Build ML analysis payload
+            var analysisRequest = await BuildAnalysisRequestAsync(context.Request, requestId, clientIp);
+
+            // 3. Call ML server
+            var analysisResult = await isolationClient.AnalyzeRequestAsync(analysisRequest);
+
+            // 4. Route the request (real call or honeypot)
+            var (responseMessage, routingDecision) = await routingService.RouteRequestAsync(
+                context.Request,
+                analysisResult,
+                requestId);
+
+            // 5. Write response back to client
+            if (responseMessage != null)
             {
-                await _next(context);
-                return;
-            }
+                context.Response.StatusCode = (int)responseMessage.StatusCode;
 
-            try
-            {
-                // ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
-                // 2️⃣ استخراج IP العميل
-                // ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
-                var clientIp = context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
-
-                // ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
-                // 3️⃣ STEP 1: قراءة الطلب + التخزين المؤقت
-                // ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
-                var requestId = Guid.NewGuid().ToString();
-
-                await cacheService.CacheRequestAsync(context.Request, requestId, clientIp);
-
-                // ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
-                // 4️⃣ STEP 2: بناء طلب ML
-                // ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
-                var analysisRequest = await BuildAnalysisRequestAsync(context.Request, requestId, clientIp);
-
-                // ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
-                // 5️⃣ STEP 3: استدعاء Isolation Forest (ML)
-                // ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
-                var analysisResult = await isolationClient.AnalyzeRequestAsync(analysisRequest);
-
-                // ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
-                // 6️⃣ STEP 4: استدعاء خدمة التوجيه (RoutingService)
-                // ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
-                var (response, routingDecision) =
-                    await routingService.RouteRequestAsync(context.Request, analysisResult);
-
-                // ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
-                // 7️⃣ STEP 5: إعادة الاستجابة للعميل
-                // ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
-                if (response != null)
+                // Copy headers
+                foreach (var header in responseMessage.Headers)
                 {
-                    context.Response.StatusCode = (int)response.StatusCode;
-
-                    foreach (var header in response.Headers)
-                    {
-                        context.Response.Headers[header.Key] = header.Value.ToArray();
-                    }
-
-                    context.Response.Headers["X-Gateway-Request-Id"] = routingDecision.RequestId;
-                    context.Response.Headers["X-Gateway-Routed-To"] = routingDecision.RoutedTo ?? "unknown";
-
-                    var body = await response.Content.ReadAsStringAsync();
-                    await context.Response.WriteAsync(body);
+                    context.Response.Headers[header.Key] = header.Value.ToArray();
                 }
-                else
+                foreach (var header in responseMessage.Content.Headers)
                 {
-                    // ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
-                    //      📌 Simulation Mode — بدون اتصال خارجي
-                    // ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
-                    context.Response.StatusCode = 200;
-
-                    await context.Response.WriteAsJsonAsync(new
-                    {
-                        routingDecision.RequestId,
-                        routingDecision.IsAnomaly,
-                        routingDecision.Confidence,
-                        routingDecision.MLModelVersion,
-                        routingDecision.RoutedTo,
-                        routingDecision.TargetUrl,
-                        routingDecision.RoutedAt,
-                        message = "Routing simulated (no real upstream call yet)"
-                    });
+                    context.Response.Headers[header.Key] = header.Value.ToArray();
                 }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Gateway middleware error");
 
-                context.Response.StatusCode = 500;
+                // Add gateway trace headers
+                context.Response.Headers["X-Gateway-Request-Id"] = routingDecision.RequestId;
+                context.Response.Headers["X-Gateway-Routed-To"] = routingDecision.RoutedTo;
+                context.Response.Headers["X-Gateway-Anomaly"] = routingDecision.IsAnomaly.ToString().ToLower();
+                context.Response.Headers["X-Gateway-Confidence"] = ((float)routingDecision.Confidence).ToString("F4");
+
+                // Stream body
+                await responseMessage.Content.CopyToAsync(context.Response.Body);
+            }
+            else
+            {
+                // Fallback when upstream failed (should rarely happen)
+                context.Response.StatusCode = 502;
                 await context.Response.WriteAsJsonAsync(new
                 {
-                    error = "Internal gateway error",
-                    message = ex.Message
+                    error = "Bad Gateway",
+                    message = "Upstream service unavailable",
+                    requestId
                 });
             }
         }
-
-        // ---------------------------------------------------------------
-        // 🔧 Helper: build ML analysis request
-        // ---------------------------------------------------------------
-        private async Task<AnalysisRequest> BuildAnalysisRequestAsync(HttpRequest request, string requestId, string clientIp)
+        catch (Exception ex)
         {
-            object payload = null;
+            _logger.LogError(ex, "Gateway middleware failed for RequestId={RequestId}", requestId);
 
-            if (request.ContentLength > 0)
+            context.Response.StatusCode = 500;
+            context.Response.ContentType = "application/json";
+            await context.Response.WriteAsJsonAsync(new
             {
-                request.EnableBuffering();
-                request.Body.Position = 0;
-
-                using var reader = new StreamReader(request.Body, leaveOpen: true);
-                var text = await reader.ReadToEndAsync();
-
-                if (!string.IsNullOrWhiteSpace(text))
-                {
-                    try { payload = JsonSerializer.Deserialize<object>(text); }
-                    catch { payload = text; }
-                }
-
-                request.Body.Position = 0;
-            }
-
-            return new AnalysisRequest
-            {
-                RequestId = requestId,
-                IpAddress = clientIp,
-                Endpoint = request.Path.Value,
-                HttpMethod = request.Method,
-                Headers = request.Headers.ToDictionary(h => h.Key, h => h.Value.ToString()),
-                Payload = payload,
-                Timestamp = DateTime.UtcNow
-            };
+                error = "Gateway Internal Error",
+                message = ex.Message,
+                requestId
+            });
         }
     }
 
-    // ---------------------------------------------------------------
-    // Extension method: UseGatewayMiddleware()
-    // ---------------------------------------------------------------
-    public static class GatewayMiddlewareExtensions
+    private async Task<AnalysisRequest> BuildAnalysisRequestAsync(HttpRequest request, string requestId, string clientIp)
     {
-        public static IApplicationBuilder UseGatewayMiddleware(this IApplicationBuilder builder)
+        string? bodyText = null;
+
+        if (request.ContentLength > 0)
         {
-            return builder.UseMiddleware<GatewayMiddleware>();
+            request.EnableBuffering();
+            request.Body.Position = 0;
+
+            using var reader = new StreamReader(request.Body, Encoding.UTF8, leaveOpen: true);
+            bodyText = await reader.ReadToEndAsync();
+            request.Body.Position = 0; // Rewind for downstream
         }
+
+        object? payload = null;
+        if (!string.IsNullOrWhiteSpace(bodyText))
+        {
+            try
+            {
+                payload = JsonSerializer.Deserialize<object>(bodyText);
+            }
+            catch
+            {
+                payload = bodyText; // fallback to raw string
+            }
+        }
+
+        return new AnalysisRequest
+        {
+            RequestId = requestId,
+            IpAddress = clientIp,
+            Endpoint = request.Path.Value ?? "",
+            HttpMethod = request.Method,
+            QueryString = request.QueryString.Value ?? "",
+            Headers = request.Headers.ToDictionary(h => h.Key, h => h.Value.ToString()),
+            Payload = payload,
+            ContentType = request.ContentType ?? "",
+            Timestamp = DateTime.UtcNow
+        };
+    }
+
+    private static string GetClientIp(HttpContext context)
+    {
+        // Handle proxies/load balancers
+        if (context.Request.Headers.TryGetValue("X-Forwarded-For", out var forwardedFor))
+        {
+            return forwardedFor.FirstOrDefault() ?? context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+        }
+
+        if (context.Request.Headers.TryGetValue("X-Real-IP", out var realIp))
+        {
+            return realIp.ToString();
+        }
+
+        return context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+    }
+}
+
+// Extension method
+public static class GatewayMiddlewareExtensions
+{
+    public static IApplicationBuilder UseGatewayMiddleware(this IApplicationBuilder builder)
+    {
+        return builder.UseMiddleware<GatewayMiddleware>();
     }
 }

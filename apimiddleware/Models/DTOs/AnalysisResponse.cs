@@ -1,13 +1,22 @@
-﻿using System;
+﻿// Models/DTOs/AnalysisResponse.cs
+using System.Text.Json.Serialization;
 
-namespace ApiMiddleware.Models.DTOs
+namespace ApiMiddleware.Models.DTOs;
+
+public class AnalysisResponse
 {
-    public class AnalysisResponse
-    {
-        public string RequestId { get; set; }
-        public bool IsAnomaly { get; set; }
-        public float Confidence { get; set; }
-        public string ModelVersion { get; set; }
-        public DateTime AnalyzedAt { get; set; }
-    }
+    [JsonPropertyName("request_id")]
+    public string RequestId { get; set; } = string.Empty;
+
+    [JsonPropertyName("is_anomaly")]
+    public bool IsAnomaly { get; set; }
+
+    [JsonPropertyName("confidence")]
+    public float Confidence { get; set; }
+
+    [JsonPropertyName("model_version")]
+    public string ModelVersion { get; set; } = "1.0.0";
+
+    [JsonPropertyName("processed_at")]
+    public DateTime ProcessedAt { get; set; }
 }
