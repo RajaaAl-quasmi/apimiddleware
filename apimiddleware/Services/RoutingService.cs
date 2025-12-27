@@ -41,7 +41,7 @@ public class RoutingService
         var stopwatch = Stopwatch.StartNew();
         bool isAnomaly = analysisResult.IsAnomaly;
         string target = isAnomaly ? "honeypot" : "real_system";
-        string targetUrl = isAnomaly ? _honeypotUrl : _realSystemUrl;
+        string targetUrl = isAnomaly ? (_honeypotUrl+"/api/") : _realSystemUrl;
 
         var decision = new RoutingDecision
         {
@@ -59,12 +59,20 @@ public class RoutingService
         decision.CachedRequestId = cachedRequest?.Id ?? 0;
 
         HttpResponseMessage? upstreamResponse = null;
-
+        string forordpath = "";
+        if (isAnomaly)
+        {
+            forordpath = originalRequest.Path.ToString().Remove(0,1).Replace('/', '-');
+        }
+        else
+        {
+            forordpath = originalRequest.Path;
+        }
         try
         {
             var upstreamRequest = new HttpRequestMessage(
                 new HttpMethod(originalRequest.Method),
-                new Uri(targetUrl + originalRequest.Path + originalRequest.QueryString));
+                new Uri(targetUrl + forordpath + originalRequest.QueryString));
 
             // Copy headers (skip Host header)
             foreach (var header in originalRequest.Headers)
@@ -118,21 +126,27 @@ public class RoutingService
                     ? bodyString[..1000] + "..."
                     : bodyString;
 
-                decision.ResponseHeadersJson = JsonSerializer.Serialize(
-                    upstreamResponse.Headers
-                        .Concat(upstreamResponse.Content.Headers)
-                        .ToDictionary(h => h.Key, h => h.Value.ToArray()));
+                // Capture headers before replacing content
+                var headersDict = upstreamResponse.Headers
+                    .Concat(upstreamResponse.Content.Headers)
+                    .ToDictionary(h => h.Key, h => h.Value.ToArray());
 
-                // Re-attach body so gateway can stream it to client
-                upstreamResponse.Content = new ByteArrayContent(bodyBytes);
-                foreach (var h in upstreamResponse.Content.Headers)
+                decision.ResponseHeadersJson = JsonSerializer.Serialize(headersDict);
+
+                // Re-attach body and headers so gateway can stream it to client
+                var newContent = new ByteArrayContent(bodyBytes);
+                
+                // Copy ONLY safe content headers to the new content
+                foreach (var header in upstreamResponse.Content.Headers)
                 {
-                    upstreamResponse.Content.Headers.Remove(h.Key);
+                    // Skip headers that will be managed by the transport layer
+                    if (ShouldSkipContentHeader(header.Key))
+                        continue;
+
+                    newContent.Headers.TryAddWithoutValidation(header.Key, header.Value);
                 }
-                foreach (var h in upstreamResponse.Content.Headers)
-                {
-                    upstreamResponse.Content.Headers.TryAddWithoutValidation(h.Key, h.Value);
-                }
+
+                upstreamResponse.Content = newContent;
             }
         }
         catch (Exception ex)
@@ -155,5 +169,14 @@ public class RoutingService
         await _dbContext.SaveChangesAsync();
 
         return (upstreamResponse, decision);
+    }
+
+    private static bool ShouldSkipContentHeader(string headerName)
+    {
+        // These headers should NOT be copied to ByteArrayContent
+        // as they will cause encoding issues when re-streamed
+        return headerName.Equals("Transfer-Encoding", StringComparison.OrdinalIgnoreCase) ||
+               headerName.Equals("Content-Length", StringComparison.OrdinalIgnoreCase) ||
+               headerName.Equals("Content-Encoding", StringComparison.OrdinalIgnoreCase);
     }
 }

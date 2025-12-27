@@ -62,14 +62,37 @@ public class GatewayMiddleware
             {
                 context.Response.StatusCode = (int)responseMessage.StatusCode;
 
-                // Copy headers
+                // Copy headers, but skip problematic ones
                 foreach (var header in responseMessage.Headers)
                 {
-                    context.Response.Headers[header.Key] = header.Value.ToArray();
+                    // Skip headers that can cause encoding issues
+                    if (ShouldSkipHeader(header.Key))
+                        continue;
+
+                    try
+                    {
+                        context.Response.Headers[header.Key] = header.Value.ToArray();
+                    }
+                    catch
+                    {
+                        // Ignore headers that can't be set
+                    }
                 }
+
                 foreach (var header in responseMessage.Content.Headers)
                 {
-                    context.Response.Headers[header.Key] = header.Value.ToArray();
+                    // Skip problematic content headers
+                    if (ShouldSkipHeader(header.Key))
+                        continue;
+
+                    try
+                    {
+                        context.Response.Headers[header.Key] = header.Value.ToArray();
+                    }
+                    catch
+                    {
+                        // Ignore headers that can't be set
+                    }
                 }
 
                 // Add gateway trace headers
@@ -78,13 +101,17 @@ public class GatewayMiddleware
                 context.Response.Headers["X-Gateway-Anomaly"] = routingDecision.IsAnomaly.ToString().ToLower();
                 context.Response.Headers["X-Gateway-Confidence"] = ((float)routingDecision.Confidence).ToString("F4");
 
-                // Stream body
-                await responseMessage.Content.CopyToAsync(context.Response.Body);
+                // Stream body directly
+                if (responseMessage.Content != null)
+                {
+                    await responseMessage.Content.CopyToAsync(context.Response.Body);
+                }
             }
             else
             {
                 // Fallback when upstream failed (should rarely happen)
                 context.Response.StatusCode = 502;
+                context.Response.ContentType = "application/json";
                 await context.Response.WriteAsJsonAsync(new
                 {
                     error = "Bad Gateway",
@@ -106,6 +133,15 @@ public class GatewayMiddleware
                 requestId
             });
         }
+    }
+
+    private static bool ShouldSkipHeader(string headerName)
+    {
+        // These headers are managed by ASP.NET Core and should not be copied
+        return headerName.Equals("Transfer-Encoding", StringComparison.OrdinalIgnoreCase) ||
+               headerName.Equals("Content-Length", StringComparison.OrdinalIgnoreCase) ||
+               headerName.Equals("Content-Encoding", StringComparison.OrdinalIgnoreCase) ||
+               headerName.Equals("Connection", StringComparison.OrdinalIgnoreCase);
     }
 
     private async Task<AnalysisRequest> BuildAnalysisRequestAsync(HttpRequest request, string requestId, string clientIp)

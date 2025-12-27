@@ -8,7 +8,7 @@ public class AnalysisResponse
     [JsonPropertyName("request_id")]
     public string RequestId { get; set; } = string.Empty;
 
-    [JsonPropertyName("is_anomaly")]
+    [JsonPropertyName("isAnomaly")]
     public bool IsAnomaly { get; set; }
 
     [JsonPropertyName("confidence")]
@@ -17,6 +17,6 @@ public class AnalysisResponse
     [JsonPropertyName("model_version")]
     public string ModelVersion { get; set; } = "1.0.0";
 
-    [JsonPropertyName("processed_at")]
+    [JsonPropertyName("analyzed_at")]
     public DateTime ProcessedAt { get; set; }
 }
