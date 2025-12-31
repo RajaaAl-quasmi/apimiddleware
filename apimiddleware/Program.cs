@@ -1,10 +1,11 @@
 ﻿using ApiMiddleware.Data;
 using ApiMiddleware.Middleware;
-using ApiMiddleware.Services;
 using ApiMiddleware.Models;
+using ApiMiddleware.Services;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using Pomelo.EntityFrameworkCore.MySql;
+using System.Net;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -17,6 +18,18 @@ builder.Services.AddHttpClient<IsolationForestClient>((sp, client) =>
     var opt = sp.GetRequiredService<IOptions<IsolationForestOptions>>().Value;
     client.BaseAddress = new Uri(opt.Url.TrimEnd('/') + "/");
 });
+
+builder.Services.AddHttpClient("ProxyClient")
+    .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler
+    {
+        AutomaticDecompression = DecompressionMethods.GZip
+                               | DecompressionMethods.Deflate
+                               | DecompressionMethods.Brotli,
+        AllowAutoRedirect = false,
+        UseCookies = false,
+        UseProxy = false, // Disable proxy for better performance
+        MaxConnectionsPerServer = 100 // Allow more concurrent connections
+    });
 
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();

@@ -6,6 +6,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using System.Diagnostics;
 using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 
@@ -28,7 +29,6 @@ public class RoutingService
         _httpClientFactory = httpClientFactory;
         _dbContext = dbContext;
         _logger = logger;
-
         _honeypotUrl = (configuration["ServiceUrls:HoneypotApi"] ?? "http://localhost:5001").TrimEnd('/');
         _realSystemUrl = (configuration["ServiceUrls:RealSystem"] ?? "http://localhost:5000").TrimEnd('/');
     }
@@ -41,7 +41,7 @@ public class RoutingService
         var stopwatch = Stopwatch.StartNew();
         bool isAnomaly = analysisResult.IsAnomaly;
         string target = isAnomaly ? "honeypot" : "real_system";
-        string targetUrl = isAnomaly ? (_honeypotUrl+"/api/") : _realSystemUrl;
+        string targetUrl = isAnomaly ? _honeypotUrl : _realSystemUrl;
 
         var decision = new RoutingDecision
         {
@@ -53,41 +53,56 @@ public class RoutingService
             DecidedAt = DateTime.UtcNow
         };
 
-        // Link to cached request
         var cachedRequest = await _dbContext.CachedRequests
             .FirstOrDefaultAsync(c => c.RequestId == requestId);
         decision.CachedRequestId = cachedRequest?.Id ?? 0;
 
         HttpResponseMessage? upstreamResponse = null;
-        string forordpath = "";
+
+        // Fix path construction - preserve the original path
+        string forwardPath = originalRequest.Path.Value ?? string.Empty;
+
+        // If honeypot needs special routing, add prefix (optional - adjust based on your honeypot setup)
         if (isAnomaly)
         {
-            forordpath = originalRequest.Path.ToString().Remove(0,1).Replace('/', '-');
+            forwardPath = "/api/" + forwardPath.Replace('/','-');
         }
-        else
-        {
-            forordpath = originalRequest.Path;
-        }
+
+        // Construct full URL
+        var finalUrl = $"{targetUrl}{forwardPath}{originalRequest.QueryString}";
+
         try
         {
+            _logger.LogInformation(
+                "Routing RequestId={RequestId} (IsAnomaly={IsAnomaly}) to {Target} at URL: {Url}",
+                requestId,
+                isAnomaly,
+                target,
+                finalUrl);
+
             var upstreamRequest = new HttpRequestMessage(
                 new HttpMethod(originalRequest.Method),
-                new Uri(targetUrl + forordpath + originalRequest.QueryString));
+                new Uri(finalUrl));
 
-            // Copy headers (skip Host header)
+            // Add Accept header for JSON
+            upstreamRequest.Headers.Accept.Add(
+                new MediaTypeWithQualityHeaderValue("application/json"));
+
+            // Copy headers (skip Host and other problematic headers)
             foreach (var header in originalRequest.Headers)
             {
-                if (string.Equals(header.Key, "Host", StringComparison.OrdinalIgnoreCase))
+                if (string.Equals(header.Key, "Host", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(header.Key, "Connection", StringComparison.OrdinalIgnoreCase))
                     continue;
 
-                var added = upstreamRequest.Headers.TryAddWithoutValidation(header.Key, header.Value.ToArray());
+                bool added = upstreamRequest.Headers.TryAddWithoutValidation(header.Key, header.Value.ToArray());
                 if (!added && upstreamRequest.Content != null)
                 {
                     upstreamRequest.Content.Headers.TryAddWithoutValidation(header.Key, header.Value.ToArray());
                 }
             }
 
-            // Copy body for POST/PUT/PATCH etc.
+            // Copy request body
             if (HttpMethods.IsPost(originalRequest.Method) ||
                 HttpMethods.IsPut(originalRequest.Method) ||
                 HttpMethods.IsPatch(originalRequest.Method))
@@ -98,85 +113,172 @@ public class RoutingService
                     originalRequest.Body.Position = 0;
 
                     var content = new StreamContent(originalRequest.Body);
-                    content.Headers.ContentType = originalRequest.ContentType is not null
-                        ? new System.Net.Http.Headers.MediaTypeHeaderValue(originalRequest.ContentType)
-                        : null;
-
+                    if (originalRequest.ContentType != null)
+                    {
+                        content.Headers.ContentType = new MediaTypeHeaderValue(originalRequest.ContentType);
+                    }
                     upstreamRequest.Content = content;
                 }
             }
 
-            var client = _httpClientFactory.CreateClient();
+            // Use client with automatic decompression
+            var client = _httpClientFactory.CreateClient("ProxyClient");
             client.Timeout = TimeSpan.FromSeconds(30);
 
             upstreamResponse = await client.SendAsync(upstreamRequest);
-
             stopwatch.Stop();
 
             decision.ResponseStatusCode = (int)upstreamResponse.StatusCode;
             decision.ResponseTimeMs = stopwatch.ElapsedMilliseconds;
 
-            // Capture response body and headers for audit
-            if (upstreamResponse.Content is not null)
+            // Process response
+            if (upstreamResponse.Content != null)
             {
-                var bodyBytes = await upstreamResponse.Content.ReadAsByteArrayAsync();
-                var bodyString = Encoding.UTF8.GetString(bodyBytes);
+                var contentType = upstreamResponse.Content.Headers.ContentType?.MediaType;
 
-                decision.ResponseBodyPreview = bodyString.Length > 1000
-                    ? bodyString[..1000] + "..."
-                    : bodyString;
-
-                // Capture headers before replacing content
-                var headersDict = upstreamResponse.Headers
-                    .Concat(upstreamResponse.Content.Headers)
-                    .ToDictionary(h => h.Key, h => h.Value.ToArray());
-
-                decision.ResponseHeadersJson = JsonSerializer.Serialize(headersDict);
-
-                // Re-attach body and headers so gateway can stream it to client
-                var newContent = new ByteArrayContent(bodyBytes);
-                
-                // Copy ONLY safe content headers to the new content
-                foreach (var header in upstreamResponse.Content.Headers)
+                // Log warning if not JSON
+                if (contentType != null && !contentType.Contains("application/json", StringComparison.OrdinalIgnoreCase))
                 {
-                    // Skip headers that will be managed by the transport layer
-                    if (ShouldSkipContentHeader(header.Key))
-                        continue;
-
-                    newContent.Headers.TryAddWithoutValidation(header.Key, header.Value);
+                    _logger.LogWarning(
+                        "Unexpected content type: {ContentType} for RequestId={RequestId} from {Target}",
+                        contentType,
+                        requestId,
+                        target);
                 }
 
-                upstreamResponse.Content = newContent;
+                byte[] contentBytes = await upstreamResponse.Content.ReadAsByteArrayAsync();
+                string bodyString = Encoding.UTF8.GetString(contentBytes);
+
+
+                decision.ResponseBodyPreview = bodyString.Length > 1000
+                    ? bodyString.Substring(0, 1000) + "..."
+                    : bodyString;
+
+                // Collect all headers
+                var allHeaders = upstreamResponse.Headers
+                    .Concat(upstreamResponse.Content.Headers)
+                    .ToDictionary(h => h.Key, h => h.Value.ToArray(), StringComparer.OrdinalIgnoreCase);
+                decision.ResponseHeadersJson = JsonSerializer.Serialize(allHeaders);
+
+                // Clean conflicting headers to avoid proxy issues
+                upstreamResponse.Content.Headers.ContentEncoding.Clear();
+                upstreamResponse.Headers.TransferEncoding.Clear();
+                upstreamResponse.Headers.TransferEncodingChunked = false;
+                upstreamResponse.Content.Headers.ContentLength = null;
+                upstreamResponse.Content.Headers.Remove("Content-MD5");
+
+                _logger.LogInformation(
+                    "Successfully routed RequestId={RequestId} to {Target}, Status={StatusCode}, Time={TimeMs}ms",
+                    requestId,
+                    target,
+                    decision.ResponseStatusCode,
+                    decision.ResponseTimeMs);
             }
+            else
+            {
+                var headersDict = upstreamResponse.Headers
+                    .ToDictionary(h => h.Key, h => h.Value.ToArray(), StringComparer.OrdinalIgnoreCase);
+                decision.ResponseHeadersJson = JsonSerializer.Serialize(headersDict);
+            }
+        }
+        catch (HttpRequestException ex)
+        {
+            stopwatch.Stop();
+            _logger.LogError(ex,
+                "HTTP request failed for RequestId={RequestId} to {Target} at {Url}. StatusCode={StatusCode}",
+                requestId,
+                target,
+                finalUrl,
+                ex.StatusCode);
+
+            decision.ResponseStatusCode = ex.StatusCode.HasValue ? (int)ex.StatusCode.Value : 502;
+            decision.ResponseTimeMs = stopwatch.ElapsedMilliseconds;
+
+            var errorResponse = new
+            {
+                error = "upstream_http_error",
+                target,
+                targetUrl = finalUrl,
+                message = ex.Message,
+                statusCode = ex.StatusCode?.ToString() ?? "unknown"
+            };
+
+            decision.ResponseBodyPreview = JsonSerializer.Serialize(errorResponse);
+
+            upstreamResponse = new HttpResponseMessage(System.Net.HttpStatusCode.BadGateway)
+            {
+                Content = new StringContent(decision.ResponseBodyPreview, Encoding.UTF8, "application/json")
+            };
+        }
+        catch (TaskCanceledException ex)
+        {
+            stopwatch.Stop();
+            _logger.LogError(ex,
+                "Request timeout for RequestId={RequestId} to {Target} at {Url}",
+                requestId,
+                target,
+                finalUrl);
+
+            decision.ResponseStatusCode = 504;
+            decision.ResponseTimeMs = stopwatch.ElapsedMilliseconds;
+
+            var errorResponse = new
+            {
+                error = "upstream_timeout",
+                target,
+                targetUrl = finalUrl,
+                message = "The upstream service did not respond within the timeout period"
+            };
+
+            decision.ResponseBodyPreview = JsonSerializer.Serialize(errorResponse);
+
+            upstreamResponse = new HttpResponseMessage(System.Net.HttpStatusCode.GatewayTimeout)
+            {
+                Content = new StringContent(decision.ResponseBodyPreview, Encoding.UTF8, "application/json")
+            };
         }
         catch (Exception ex)
         {
             stopwatch.Stop();
-            _logger.LogError(ex, "Routing failed for RequestId={RequestId} to {Target}", requestId, target);
+            _logger.LogError(ex,
+                "Unexpected error routing RequestId={RequestId} to {Target} at {Url}. Exception={ExceptionType}",
+                requestId,
+                target,
+                finalUrl,
+                ex.GetType().Name);
 
             decision.ResponseStatusCode = 502;
             decision.ResponseTimeMs = stopwatch.ElapsedMilliseconds;
-            decision.ResponseBodyPreview = JsonSerializer.Serialize(new
+
+            var errorResponse = new
             {
                 error = "upstream_unavailable",
                 target,
-                message = ex.Message
-            });
+                targetUrl = finalUrl,
+                message = ex.Message,
+                exceptionType = ex.GetType().Name
+            };
+
+            decision.ResponseBodyPreview = JsonSerializer.Serialize(errorResponse);
+
+            upstreamResponse = new HttpResponseMessage(System.Net.HttpStatusCode.BadGateway)
+            {
+                Content = new StringContent(decision.ResponseBodyPreview, Encoding.UTF8, "application/json")
+            };
         }
 
-        // Save decision to database
-        _dbContext.RoutingDecisions.Add(decision);
-        await _dbContext.SaveChangesAsync();
+        // Save routing decision
+        try
+        {
+            _dbContext.RoutingDecisions.Add(decision);
+            await _dbContext.SaveChangesAsync();
+        }
+        catch (Exception dbEx)
+        {
+            _logger.LogError(dbEx, "Failed to save routing decision for RequestId={RequestId}", requestId);
+            // Don't fail the request if database save fails
+        }
 
         return (upstreamResponse, decision);
-    }
-
-    private static bool ShouldSkipContentHeader(string headerName)
-    {
-        // These headers should NOT be copied to ByteArrayContent
-        // as they will cause encoding issues when re-streamed
-        return headerName.Equals("Transfer-Encoding", StringComparison.OrdinalIgnoreCase) ||
-               headerName.Equals("Content-Length", StringComparison.OrdinalIgnoreCase) ||
-               headerName.Equals("Content-Encoding", StringComparison.OrdinalIgnoreCase);
     }
 }
