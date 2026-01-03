@@ -51,7 +51,7 @@ public class GatewayMiddleware
             // 3. Call ML server
             var analysisResult = await isolationClient.AnalyzeRequestAsync(analysisRequest);
 
-            // 4. Route the request (real call or honeypot)
+            // 4. Route the request (real call or honeypot 000)
             var (responseMessage, routingDecision) = await routingService.RouteRequestAsync(
                 context.Request,
                 analysisResult,

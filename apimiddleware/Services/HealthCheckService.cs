@@ -103,7 +103,7 @@ public class HealthCheckService
 
         try
         {
-            // Try common health endpoints
+            // Try common health endpoints 00000
             var urlsToTry = new[]
             {
                 $"{baseUrl}/health",
